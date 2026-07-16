@@ -36,13 +36,27 @@ function thisMonth() {
 
 function nextMonthISO(month) {
   const [y, m] = month.split('-').map(Number);
-  const d = new Date(y, m, 1); // m is already 0-indexed for "next month"
+  const d = new Date(y, m, 1);
   return d.toISOString().slice(0, 10);
 }
 
 function fmtBaht(n) {
   return '฿' + Number(n).toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
+
+function addDays(dateStr, delta) {
+  const d = new Date(dateStr + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + delta);
+  return d.toISOString().slice(0, 10);
+}
+
+function progressBar(pct) {
+  const clamped = Math.min(100, Math.max(0, pct));
+  const filled = Math.round((clamped / 100) * 10);
+  return '▓'.repeat(filled) + '░'.repeat(10 - filled);
+}
+
+const STREAK_MILESTONES = [3, 7, 14, 30, 60, 100];
 
 const app = express();
 app.use(cors());
@@ -272,6 +286,34 @@ async function getDeviceByLineUser(lineUserId) {
   return data || null;
 }
 
+async function computeStreak(deviceId) {
+  const { data: rows } = await supabase.from('transactions').select('date').eq('device_id', deviceId);
+  const dateSet = new Set((rows || []).map((r) => r.date));
+  const today = todayISO();
+  let cursor;
+  if (dateSet.has(today)) cursor = today;
+  else if (dateSet.has(addDays(today, -1))) cursor = addDays(today, -1);
+  else return 0;
+
+  let streak = 0;
+  while (dateSet.has(cursor)) {
+    streak++;
+    cursor = addDays(cursor, -1);
+  }
+  return streak;
+}
+
+async function getActiveGoal(deviceId) {
+  const { data } = await supabase
+    .from('goals')
+    .select('*')
+    .eq('device_id', deviceId)
+    .eq('achieved', false)
+    .order('created_at', { ascending: false })
+    .limit(1);
+  return (data && data[0]) || null;
+}
+
 async function getPending(lineUserId) {
   const { data } = await supabase.from('pending_slips').select('*').eq('line_user_id', lineUserId).single();
   return data || null;
@@ -320,6 +362,23 @@ async function handleTextMessage(event, userId, text) {
     );
   }
 
+  let m;
+  if ((m = text.match(/^ตั้งงบ\s+([\d,]+(?:\.\d+)?)$/))) {
+    return handleSetBudgetCommand(event, userId, m);
+  }
+  if ((m = text.match(/^ตั้งเป้าหมาย\s+(.+?)\s+([\d,]+(?:\.\d+)?)$/))) {
+    return handleSetGoalCommand(event, userId, m);
+  }
+  if ((m = text.match(/^ออม\s+([\d,]+(?:\.\d+)?)$/))) {
+    return handleContributeGoalCommand(event, userId, m);
+  }
+  if (text === 'เป้าหมาย') {
+    return handleGoalStatusCommand(event, userId);
+  }
+  if (text === 'สถิติ') {
+    return handleStatsCommand(event, userId);
+  }
+
   if (text === 'สรุป' || text === 'สรุปยอด') {
     return handleSummaryCommand(event, userId);
   }
@@ -350,8 +409,121 @@ async function handleTextMessage(event, userId, text) {
 
   return replyText(
     event,
-    'ส่งรูปสลิปโอนเงินมาได้เลย 📸\nหรือพิมพ์ "รายรับ" / "รายจ่าย" เพื่อบันทึกด่วน\nหรือพิมพ์ "สรุป" เพื่อดูยอดเดือนนี้\nพิมพ์รหัส 6 หลักจากหน้าเว็บแอปเพื่อเชื่อมบัญชีก่อนใช้งานครั้งแรก'
+    'ส่งรูปสลิปโอนเงินมาได้เลย 📸\nหรือพิมพ์ "รายรับ" / "รายจ่าย" เพื่อบันทึกด่วน\nพิมพ์ "สรุป" ดูยอดเดือนนี้ | "สถิติ" ดูสตรีก+หมวดที่ใช้เยอะสุด\nพิมพ์ "ตั้งงบ 20000" ตั้งงบประมาณ | "ตั้งเป้าหมาย ทริปญี่ปุ่น 20000" ตั้งเป้าหมายออมเงิน | "ออม 500" บันทึกการออม\nพิมพ์รหัส 6 หลักจากหน้าเว็บแอปเพื่อเชื่อมบัญชีก่อนใช้งานครั้งแรก'
   );
+}
+
+async function handleSetBudgetCommand(event, userId, match) {
+  const device = await getDeviceByLineUser(userId);
+  if (!device) return replyText(event, 'กรุณาเชื่อมบัญชีก่อน โดยพิมพ์รหัส 6 หลักจากหน้าเว็บแอป');
+  const amount = parseFloat(match[1].replace(/,/g, ''));
+  if (!amount || amount <= 0) {
+    return replyText(event, 'จำนวนงบประมาณไม่ถูกต้อง ลองพิมพ์ใหม่ เช่น "ตั้งงบ 20000"');
+  }
+  await supabase
+    .from('devices')
+    .update({ monthly_budget: amount, last_budget_alert_level: 0, last_budget_alert_month: null })
+    .eq('id', device.id);
+  return replyText(event, `ตั้งงบประมาณเดือนนี้เป็น ${fmtBaht(amount)} แล้ว 🎯`);
+}
+
+async function handleSetGoalCommand(event, userId, match) {
+  const device = await getDeviceByLineUser(userId);
+  if (!device) return replyText(event, 'กรุณาเชื่อมบัญชีก่อน โดยพิมพ์รหัส 6 หลักจากหน้าเว็บแอป');
+  const name = match[1].trim();
+  const amount = parseFloat(match[2].replace(/,/g, ''));
+  if (!name || !amount || amount <= 0) {
+    return replyText(event, 'รูปแบบไม่ถูกต้อง ลองพิมพ์ใหม่ เช่น "ตั้งเป้าหมาย ทริปญี่ปุ่น 20000"');
+  }
+  const { error } = await supabase.from('goals').insert({ device_id: device.id, name, target_amount: amount, saved_amount: 0 });
+  if (error) {
+    console.error(error);
+    return replyText(event, 'ตั้งเป้าหมายไม่สำเร็จ ลองใหม่อีกครั้ง');
+  }
+  return replyText(
+    event,
+    `ตั้งเป้าหมายใหม่แล้ว 🎯 "${name}" เป้าหมาย ${fmtBaht(amount)}\nพิมพ์ "ออม <จำนวนเงิน>" เพื่อบันทึกการออมเข้าเป้าหมายนี้`
+  );
+}
+
+async function handleContributeGoalCommand(event, userId, match) {
+  const device = await getDeviceByLineUser(userId);
+  if (!device) return replyText(event, 'กรุณาเชื่อมบัญชีก่อน โดยพิมพ์รหัส 6 หลักจากหน้าเว็บแอป');
+  const amount = parseFloat(match[1].replace(/,/g, ''));
+  if (!amount || amount <= 0) {
+    return replyText(event, 'จำนวนเงินไม่ถูกต้อง ลองพิมพ์ใหม่ เช่น "ออม 500"');
+  }
+  const goal = await getActiveGoal(device.id);
+  if (!goal) {
+    return replyText(event, 'ยังไม่มีเป้าหมายที่ตั้งไว้ พิมพ์ "ตั้งเป้าหมาย <ชื่อ> <จำนวนเงิน>" เพื่อเริ่มตั้งเป้าหมายก่อน');
+  }
+  const newSaved = Number(goal.saved_amount) + amount;
+  const achieved = newSaved >= Number(goal.target_amount);
+  await supabase.from('goals').update({ saved_amount: newSaved, achieved }).eq('id', goal.id);
+  const pct = Math.min(100, Math.round((newSaved / Number(goal.target_amount)) * 100));
+
+  if (achieved) {
+    return replyText(
+      event,
+      `🎉 ยินดีด้วย! คุณออมครบเป้าหมาย "${goal.name}" แล้ว!\n${progressBar(100)} 100%\nรวมออม ${fmtBaht(newSaved)}`
+    );
+  }
+  return replyText(
+    event,
+    `ออมเพิ่ม ${fmtBaht(amount)} เข้าเป้าหมาย "${goal.name}" แล้ว 🎯\n${progressBar(pct)} ${pct}%\nออมแล้ว ${fmtBaht(newSaved)} จาก ${fmtBaht(
+      goal.target_amount
+    )}`
+  );
+}
+
+async function handleGoalStatusCommand(event, userId) {
+  const device = await getDeviceByLineUser(userId);
+  if (!device) return replyText(event, 'กรุณาเชื่อมบัญชีก่อน โดยพิมพ์รหัส 6 หลักจากหน้าเว็บแอป');
+  const goal = await getActiveGoal(device.id);
+  if (!goal) {
+    return replyText(
+      event,
+      'ยังไม่มีเป้าหมายที่ตั้งไว้ พิมพ์ "ตั้งเป้าหมาย <ชื่อ> <จำนวนเงิน>" เพื่อเริ่มตั้งเป้าหมาย เช่น "ตั้งเป้าหมาย ทริปญี่ปุ่น 20000"'
+    );
+  }
+  const pct = Math.min(100, Math.round((Number(goal.saved_amount) / Number(goal.target_amount)) * 100));
+  return replyText(
+    event,
+    `🎯 เป้าหมาย: ${goal.name}\n${progressBar(pct)} ${pct}%\nออมแล้ว ${fmtBaht(goal.saved_amount)} จาก ${fmtBaht(goal.target_amount)}`
+  );
+}
+
+async function handleStatsCommand(event, userId) {
+  const device = await getDeviceByLineUser(userId);
+  if (!device) return replyText(event, 'กรุณาเชื่อมบัญชีก่อน โดยพิมพ์รหัส 6 หลักจากหน้าเว็บแอป');
+
+  const streak = await computeStreak(device.id);
+  const month = thisMonth();
+  const { data: rows } = await supabase
+    .from('transactions')
+    .select('category, amount')
+    .eq('device_id', device.id)
+    .eq('type', 'expense')
+    .gte('date', `${month}-01`)
+    .lt('date', nextMonthISO(month));
+
+  const byCat = {};
+  (rows || []).forEach((r) => {
+    byCat[r.category] = (byCat[r.category] || 0) + Number(r.amount);
+  });
+  const topCat = Object.entries(byCat).sort((a, b) => b[1] - a[1])[0];
+
+  let msg = `📈 สถิติของคุณ\n🔥 บันทึกติดต่อกัน ${streak} วัน`;
+  if (topCat) {
+    msg += `\n🏆 หมวดที่ใช้จ่ายเยอะสุดเดือนนี้: ${topCat[0]} (${fmtBaht(topCat[1])})`;
+  }
+
+  const goal = await getActiveGoal(device.id);
+  if (goal) {
+    const pct = Math.min(100, Math.round((Number(goal.saved_amount) / Number(goal.target_amount)) * 100));
+    msg += `\n\n🎯 เป้าหมาย: ${goal.name}\n${progressBar(pct)} ${pct}%\nออมแล้ว ${fmtBaht(goal.saved_amount)} จาก ${fmtBaht(goal.target_amount)}`;
+  }
+  return replyText(event, msg);
 }
 
 async function handleSummaryCommand(event, userId) {
@@ -510,10 +682,26 @@ async function finalizeTransaction(event, userId, pending) {
 
   const webAppUrl = process.env.WEB_APP_URL || '';
   const typeLabel = pending.type === 'income' ? 'รายรับ' : 'รายจ่าย';
-  return replyText(
-    event,
-    `บันทึก${typeLabel} ${fmtBaht(pending.amount)} (${pending.category}) เรียบร้อย ✅` + (webAppUrl ? `\nดูสรุปที่: ${webAppUrl}` : '')
-  );
+  const messages = [
+    {
+      type: 'text',
+      text: `บันทึก${typeLabel} ${fmtBaht(pending.amount)} (${pending.category}) เรียบร้อย ✅` + (webAppUrl ? `\nดูสรุปที่: ${webAppUrl}` : ''),
+    },
+  ];
+
+  try {
+    const streak = await computeStreak(pending.device_id);
+    const { data: device } = await supabase.from('devices').select('last_streak_celebrated').eq('id', pending.device_id).single();
+    const lastCelebrated = (device && device.last_streak_celebrated) || 0;
+    if (STREAK_MILESTONES.includes(streak) && streak > lastCelebrated) {
+      messages.push({ type: 'text', text: `🔥 บันทึกติดต่อกัน ${streak} วันแล้ว! เก่งมาก ทำต่อไปนะ` });
+      await supabase.from('devices').update({ last_streak_celebrated: streak }).eq('id', pending.device_id);
+    }
+  } catch (err) {
+    console.error('Streak check failed:', err);
+  }
+
+  return lineClient.replyMessage(event.replyToken, messages);
 }
 
 const port = process.env.PORT || 3000;
