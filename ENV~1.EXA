@@ -1,0 +1,16 @@
+# Copy this file to ".env" for local testing, or paste these as
+# "Environment Variables" in Render when you deploy the service.
+
+# From LINE Developers Console -> your Messaging API channel
+LINE_CHANNEL_SECRET=
+LINE_CHANNEL_ACCESS_TOKEN=
+
+# From Supabase Dashboard -> Project Settings -> API
+SUPABASE_URL=
+SUPABASE_SERVICE_KEY=
+
+# Optional: link to your web app, sent in the bot's confirmation message
+WEB_APP_URL=
+
+# Render sets this automatically; only needed for local testing
+PORT=3000
