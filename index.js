@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const line = require('@line/bot-sdk');
 const { createClient } = require('@supabase/supabase-js');
+const { createWorker } = require('tesseract.js');
 
 const REQUIRED_ENV = ['LINE_CHANNEL_SECRET', 'LINE_CHANNEL_ACCESS_TOKEN', 'SUPABASE_URL', 'SUPABASE_SERVICE_KEY'];
 const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
@@ -29,24 +30,109 @@ function todayISO() {
   return new Date().toISOString().slice(0, 10);
 }
 
+function thisMonth() {
+  return todayISO().slice(0, 7);
+}
+
+function nextMonthISO(month) {
+  const [y, m] = month.split('-').map(Number);
+  const d = new Date(y, m, 1); // m is already 0-indexed for "next month"
+  return d.toISOString().slice(0, 10);
+}
+
+function fmtBaht(n) {
+  return '฿' + Number(n).toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
 const app = express();
 app.use(cors());
 
-// ===================================================================
-// REST API used by the web app (finance-tracker.html)
-// ===================================================================
+let ocrWorkerPromise = null;
+async function getOcrWorker() {
+  if (!ocrWorkerPromise) {
+    ocrWorkerPromise = createWorker('eng');
+  }
+  return ocrWorkerPromise;
+}
+
+async function ocrExtractText(buffer) {
+  const worker = await getOcrWorker();
+  const { data } = await worker.recognize(buffer);
+  return data.text || '';
+}
+
+function guessAmountFromText(text) {
+  const cleaned = text.replace(/,/g, '');
+  const decimalMatches = cleaned.match(/\d+\.\d{2}\b/g) || [];
+  const candidates = decimalMatches.map(Number).filter((n) => n >= 1 && n <= 10000000);
+  if (candidates.length) return Math.max(...candidates);
+
+  const intMatches = cleaned.match(/\b\d{2,7}\b/g) || [];
+  const intCandidates = intMatches.map(Number).filter((n) => n >= 1 && n <= 10000000);
+  if (intCandidates.length) return Math.max(...intCandidates);
+
+  return null;
+}
+
+function streamToBuffer(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on('data', (c) => chunks.push(c));
+    stream.on('end', () => resolve(Buffer.concat(chunks)));
+    stream.on('error', reject);
+  });
+}
+
+async function checkBudgetAndNotify(deviceId) {
+  try {
+    const { data: device } = await supabase.from('devices').select('*').eq('id', deviceId).single();
+    if (!device || !device.line_user_id || !device.monthly_budget || Number(device.monthly_budget) <= 0) return;
+
+    const month = thisMonth();
+    const { data: rows } = await supabase
+      .from('transactions')
+      .select('amount')
+      .eq('device_id', deviceId)
+      .eq('type', 'expense')
+      .gte('date', `${month}-01`)
+      .lt('date', nextMonthISO(month));
+
+    const spent = (rows || []).reduce((s, r) => s + Number(r.amount), 0);
+    const budget = Number(device.monthly_budget);
+    const pct = (spent / budget) * 100;
+
+    const currentLevel = device.last_budget_alert_month === month ? device.last_budget_alert_level || 0 : 0;
+    const targetLevel = pct >= 100 ? 100 : pct >= 80 ? 80 : 0;
+
+    if (targetLevel > currentLevel) {
+      const msg =
+        targetLevel >= 100
+          ? `⚠️ เกินงบประมาณเดือนนี้แล้ว!\nใช้ไป ${fmtBaht(spent)} จากงบ ${fmtBaht(budget)}`
+          : `⏳ ใช้งบไปแล้ว ${Math.round(pct)}% ของเดือนนี้\n${fmtBaht(spent)} จากงบ ${fmtBaht(budget)}`;
+      try {
+        await lineClient.pushMessage(device.line_user_id, { type: 'text', text: msg });
+      } catch (err) {
+        console.error('Budget alert push failed:', err);
+      }
+      await supabase
+        .from('devices')
+        .update({ last_budget_alert_level: targetLevel, last_budget_alert_month: month })
+        .eq('id', deviceId);
+    } else if (device.last_budget_alert_month !== month) {
+      await supabase.from('devices').update({ last_budget_alert_level: 0, last_budget_alert_month: month }).eq('id', deviceId);
+    }
+  } catch (err) {
+    console.error('checkBudgetAndNotify error:', err);
+  }
+}
+
 const api = express.Router();
 api.use(express.json());
 
-// Create a new "device" (one web-app installation) and its link code.
 api.get('/device/new', async (req, res) => {
   try {
     const code = genLinkCode();
-    const { data, error } = await supabase
-      .from('devices')
-      .insert({ link_code: code })
-      .select()
-      .single();
+    const { data, error } = await supabase.from('devices').insert({ link_code: code }).select().single();
     if (error) throw error;
     res.json({ device_id: data.id, link_code: data.link_code });
   } catch (err) {
@@ -55,7 +141,6 @@ api.get('/device/new', async (req, res) => {
   }
 });
 
-// Check whether a device has been linked to a LINE account yet.
 api.get('/device/:id/status', async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -112,6 +197,7 @@ api.post('/transactions', async (req, res) => {
       .single();
     if (error) throw error;
     res.json(data);
+    checkBudgetAndNotify(device_id);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'บันทึกรายการไม่สำเร็จ' });
@@ -122,11 +208,7 @@ api.delete('/transactions/:id', async (req, res) => {
   const { device_id } = req.query;
   if (!device_id) return res.status(400).json({ error: 'device_id required' });
   try {
-    const { error } = await supabase
-      .from('transactions')
-      .delete()
-      .eq('id', req.params.id)
-      .eq('device_id', device_id);
+    const { error } = await supabase.from('transactions').delete().eq('id', req.params.id).eq('device_id', device_id);
     if (error) throw error;
     res.json({ ok: true });
   } catch (err) {
@@ -139,11 +221,7 @@ api.get('/budget', async (req, res) => {
   const { device_id } = req.query;
   if (!device_id) return res.status(400).json({ error: 'device_id required' });
   try {
-    const { data, error } = await supabase
-      .from('devices')
-      .select('monthly_budget')
-      .eq('id', device_id)
-      .single();
+    const { data, error } = await supabase.from('devices').select('monthly_budget').eq('id', device_id).single();
     if (error) throw error;
     res.json({ monthly_budget: Number(data.monthly_budget) || 0 });
   } catch (err) {
@@ -156,10 +234,7 @@ api.post('/budget', async (req, res) => {
   const { device_id, monthly_budget } = req.body || {};
   if (!device_id || monthly_budget == null) return res.status(400).json({ error: 'missing fields' });
   try {
-    const { error } = await supabase
-      .from('devices')
-      .update({ monthly_budget })
-      .eq('id', device_id);
+    const { error } = await supabase.from('devices').update({ monthly_budget }).eq('id', device_id);
     if (error) throw error;
     res.json({ ok: true });
   } catch (err) {
@@ -174,10 +249,6 @@ app.get('/', (req, res) => {
   res.type('text').send('LINE slip finance bot is running.');
 });
 
-// ===================================================================
-// LINE webhook — must NOT have express.json() applied before it, so
-// the bot-sdk middleware can validate the raw body signature itself.
-// ===================================================================
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   try {
     await Promise.all((req.body.events || []).map(handleEvent));
@@ -194,6 +265,11 @@ async function reply(event, message) {
 
 async function replyText(event, text) {
   return reply(event, { type: 'text', text });
+}
+
+async function getDeviceByLineUser(lineUserId) {
+  const { data } = await supabase.from('devices').select('*').eq('line_user_id', lineUserId).single();
+  return data || null;
 }
 
 async function getPending(lineUserId) {
@@ -223,13 +299,11 @@ async function handleEvent(event) {
 }
 
 async function handleTextMessage(event, userId, text) {
-  // "ยกเลิก" cancels whatever the bot is currently waiting for.
   if (text === 'ยกเลิก') {
     await clearPending(userId);
-    return replyText(event, 'ยกเลิกรายการที่ค้างอยู่แล้ว ส่งรูปสลิปใหม่ได้เลยเมื่อพร้อม');
+    return replyText(event, 'ยกเลิกรายการที่ค้างอยู่แล้ว ส่งรูปสลิปใหม่ หรือพิมพ์ "รายรับ"/"รายจ่าย" ได้เลยเมื่อพร้อม');
   }
 
-  // A bare 6-digit code is treated as a link request from the web app.
   if (/^\d{6}$/.test(text)) {
     const { data: device, error } = await supabase.from('devices').select('*').eq('link_code', text).single();
     if (error || !device) {
@@ -240,7 +314,18 @@ async function handleTextMessage(event, userId, text) {
       console.error(updateErr);
       return replyText(event, 'เชื่อมบัญชีไม่สำเร็จ ลองใหม่อีกครั้ง');
     }
-    return replyText(event, 'เชื่อมบัญชีสำเร็จ ✅\nต่อไปนี้ส่งรูปสลิปโอนเงินมาได้เลย บอทจะถามยืนยันรายละเอียดก่อนบันทึกทุกครั้ง');
+    return replyText(
+      event,
+      'เชื่อมบัญชีสำเร็จ ✅\nส่งรูปสลิปโอนเงินมาได้เลย บอทจะถามยืนยันรายละเอียดก่อนบันทึกทุกครั้ง\nหรือพิมพ์ "สรุป" เพื่อดูยอดเดือนนี้ทันที'
+    );
+  }
+
+  if (text === 'สรุป' || text === 'สรุปยอด') {
+    return handleSummaryCommand(event, userId);
+  }
+
+  if (text === 'รายรับ' || text === 'รายจ่าย') {
+    return handleQuickStart(event, userId, text === 'รายรับ' ? 'income' : 'expense');
   }
 
   const pending = await getPending(userId);
@@ -253,7 +338,7 @@ async function handleTextMessage(event, userId, text) {
     const cats = pending.type === 'income' ? INCOME_CATEGORIES : EXPENSE_CATEGORIES;
     return reply(event, {
       type: 'text',
-      text: `จำนวนเงิน ฿${amount.toLocaleString('th-TH')} — เลือกหมวดหมู่`,
+      text: `จำนวนเงิน ${fmtBaht(amount)} — เลือกหมวดหมู่`,
       quickReply: {
         items: cats.map((c) => ({
           type: 'action',
@@ -263,13 +348,67 @@ async function handleTextMessage(event, userId, text) {
     });
   }
 
-  return replyText(event, 'ส่งรูปสลิปโอนเงินมาได้เลย 📸\nหรือพิมพ์รหัส 6 หลักจากหน้าเว็บแอปเพื่อเชื่อมบัญชีก่อนใช้งานครั้งแรก');
+  return replyText(
+    event,
+    'ส่งรูปสลิปโอนเงินมาได้เลย 📸\nหรือพิมพ์ "รายรับ" / "รายจ่าย" เพื่อบันทึกด่วน\nหรือพิมพ์ "สรุป" เพื่อดูยอดเดือนนี้\nพิมพ์รหัส 6 หลักจากหน้าเว็บแอปเพื่อเชื่อมบัญชีก่อนใช้งานครั้งแรก'
+  );
+}
+
+async function handleSummaryCommand(event, userId) {
+  const device = await getDeviceByLineUser(userId);
+  if (!device) {
+    return replyText(event, 'กรุณาเชื่อมบัญชีก่อน โดยพิมพ์รหัส 6 หลักจากหน้าเว็บแอป');
+  }
+  const month = thisMonth();
+  const { data: rows } = await supabase
+    .from('transactions')
+    .select('type, amount')
+    .eq('device_id', device.id)
+    .gte('date', `${month}-01`)
+    .lt('date', nextMonthISO(month));
+
+  const income = (rows || []).filter((r) => r.type === 'income').reduce((s, r) => s + Number(r.amount), 0);
+  const expense = (rows || []).filter((r) => r.type === 'expense').reduce((s, r) => s + Number(r.amount), 0);
+
+  let msg = `📊 สรุปเดือนนี้\nรายรับ: ${fmtBaht(income)}\nรายจ่าย: ${fmtBaht(expense)}\nคงเหลือ: ${fmtBaht(income - expense)}`;
+  if (device.monthly_budget && Number(device.monthly_budget) > 0) {
+    const pct = Math.round((expense / Number(device.monthly_budget)) * 100);
+    msg += `\nงบประมาณ: ${fmtBaht(device.monthly_budget)} (ใช้ไป ${pct}%)`;
+  }
+  return replyText(event, msg);
+}
+
+async function handleQuickStart(event, userId, type) {
+  const device = await getDeviceByLineUser(userId);
+  if (!device) {
+    return replyText(event, 'กรุณาเชื่อมบัญชีก่อน โดยพิมพ์รหัส 6 หลักจากหน้าเว็บแอป');
+  }
+  await supabase.from('pending_slips').upsert({
+    line_user_id: userId,
+    device_id: device.id,
+    step: 'awaiting_amount',
+    type,
+    amount: null,
+    category: null,
+    suggested_amount: null,
+  });
+  return replyText(event, `บันทึก${type === 'income' ? 'รายรับ' : 'รายจ่าย'} — พิมพ์จำนวนเงิน (ตัวเลขเท่านั้น) เช่น 250`);
 }
 
 async function handleImageMessage(event, userId) {
-  const { data: device } = await supabase.from('devices').select('*').eq('line_user_id', userId).single();
+  const device = await getDeviceByLineUser(userId);
   if (!device) {
     return replyText(event, 'กรุณาเชื่อมบัญชีก่อน โดยพิมพ์รหัส 6 หลักที่แสดงในหน้าเว็บแอป');
+  }
+
+  let suggestedAmount = null;
+  try {
+    const stream = await lineClient.getMessageContent(event.message.id);
+    const buffer = await streamToBuffer(stream);
+    const text = await ocrExtractText(buffer);
+    suggestedAmount = guessAmountFromText(text);
+  } catch (err) {
+    console.error('OCR failed (falling back to manual entry):', err);
   }
 
   await supabase.from('pending_slips').upsert({
@@ -279,6 +418,7 @@ async function handleImageMessage(event, userId) {
     type: null,
     amount: null,
     category: null,
+    suggested_amount: suggestedAmount,
   });
 
   return reply(event, {
@@ -297,13 +437,51 @@ async function handlePostback(event, userId, dataStr) {
   const params = new URLSearchParams(dataStr);
   const pending = await getPending(userId);
   if (!pending) {
-    return replyText(event, 'ไม่พบรายการที่รอยืนยัน กรุณาส่งรูปสลิปใหม่อีกครั้ง');
+    return replyText(event, 'ไม่พบรายการที่รอยืนยัน กรุณาส่งรูปสลิปใหม่ หรือพิมพ์ "รายรับ"/"รายจ่าย" อีกครั้ง');
   }
 
   if (params.has('type')) {
     const type = params.get('type');
-    await supabase.from('pending_slips').update({ type, step: 'awaiting_amount' }).eq('line_user_id', userId);
+    await supabase.from('pending_slips').update({ type }).eq('line_user_id', userId);
+
+    if (pending.suggested_amount) {
+      await supabase.from('pending_slips').update({ step: 'confirm_amount' }).eq('line_user_id', userId);
+      return reply(event, {
+        type: 'text',
+        text: `รับทราบ: ${type === 'income' ? 'รายรับ' : 'รายจ่าย'}\nระบบตรวจพบจำนวนเงินในสลิป: ${fmtBaht(
+          pending.suggested_amount
+        )}\nถูกต้องไหม?`,
+        quickReply: {
+          items: [
+            { type: 'action', action: { type: 'postback', label: '✅ ใช่ ใช้ยอดนี้', data: 'amt_confirm=1', displayText: 'ใช่ ใช้ยอดนี้' } },
+            { type: 'action', action: { type: 'postback', label: '✏️ ไม่ใช่ พิมพ์เอง', data: 'amt_confirm=0', displayText: 'พิมพ์เอง' } },
+          ],
+        },
+      });
+    }
+
+    await supabase.from('pending_slips').update({ step: 'awaiting_amount' }).eq('line_user_id', userId);
     return replyText(event, `รับทราบ: ${type === 'income' ? 'รายรับ' : 'รายจ่าย'}\nพิมพ์จำนวนเงิน (ตัวเลขเท่านั้น) เช่น 250`);
+  }
+
+  if (params.has('amt_confirm')) {
+    const confirmed = params.get('amt_confirm') === '1';
+    if (confirmed && pending.suggested_amount) {
+      await supabase.from('pending_slips').update({ amount: pending.suggested_amount, step: 'awaiting_category' }).eq('line_user_id', userId);
+      const cats = pending.type === 'income' ? INCOME_CATEGORIES : EXPENSE_CATEGORIES;
+      return reply(event, {
+        type: 'text',
+        text: `จำนวนเงิน ${fmtBaht(pending.suggested_amount)} — เลือกหมวดหมู่`,
+        quickReply: {
+          items: cats.map((c) => ({
+            type: 'action',
+            action: { type: 'postback', label: c, data: `cat=${encodeURIComponent(c)}`, displayText: c },
+          })),
+        },
+      });
+    }
+    await supabase.from('pending_slips').update({ step: 'awaiting_amount' }).eq('line_user_id', userId);
+    return replyText(event, 'พิมพ์จำนวนเงิน (ตัวเลขเท่านั้น) เช่น 250');
   }
 
   if (params.has('cat')) {
@@ -328,12 +506,13 @@ async function finalizeTransaction(event, userId, pending) {
     return replyText(event, 'เกิดข้อผิดพลาดในการบันทึก กรุณาลองส่งรูปสลิปใหม่อีกครั้ง');
   }
 
+  checkBudgetAndNotify(pending.device_id);
+
   const webAppUrl = process.env.WEB_APP_URL || '';
   const typeLabel = pending.type === 'income' ? 'รายรับ' : 'รายจ่าย';
-  const amountLabel = Number(pending.amount).toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   return replyText(
     event,
-    `บันทึก${typeLabel} ฿${amountLabel} (${pending.category}) เรียบร้อย ✅` + (webAppUrl ? `\nดูสรุปที่: ${webAppUrl}` : '')
+    `บันทึก${typeLabel} ${fmtBaht(pending.amount)} (${pending.category}) เรียบร้อย ✅` + (webAppUrl ? `\nดูสรุปที่: ${webAppUrl}` : '')
   );
 }
 
